@@ -1,0 +1,147 @@
+name: ISO de UMBRA OS (desde el zip)
+
+# Para subir UMBRA desde el móvil: en el repositorio solo hace falta el zip del proyecto
+# (umbra-os-X.Y.Z.zip) y este archivo. Se lanza al subir cualquier cambio o a mano desde «Actions».
+on:
+  workflow_dispatch:
+  push:
+
+permissions:
+  contents: write  # necesario solo para adjuntar la ISO a una release
+
+jobs:
+  iso:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Descomprimir el proyecto (el zip más reciente)
+        run: |
+          ZIP=$(ls -t umbra-os-*.zip | head -1)
+          echo "Proyecto: $ZIP"
+          unzip -q "$ZIP" -d /tmp/umbra
+          cp -a /tmp/umbra/umbra-os-*/. .
+          ls
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Pruebas de NYX antes de construir
+        run: |
+          pip install -e ".[dev]"
+          python -m pytest -q
+
+      - name: Empaquetar NYX y la voz (Piper) dentro de la ISO
+        run: |
+          DIST=iso/config/includes.chroot/opt/umbra/dist
+          pip wheel . --no-deps -w "$DIST"
+          # Debian 13 usa Python 3.13: se descargan las ruedas para esa versión
+          pip download "piper-tts==1.8.0" --only-binary=:all: \
+            --platform manylinux_2_28_x86_64 --platform manylinux_2_17_x86_64 --platform manylinux2014_x86_64 \
+            --python-version 3.13 --implementation cp -d "$DIST"
+          # Oído de NYX (voz a texto local con Vosk)
+          pip download "vosk==0.3.45" --only-binary=:all: \
+            --platform manylinux_2_28_x86_64 --platform manylinux_2_17_x86_64 --platform manylinux2014_x86_64 \
+            --platform manylinux2010_x86_64 --platform manylinux_2_12_x86_64 \
+            --python-version 3.13 --implementation cp -d "$DIST"
+          ls -lh "$DIST"
+
+      - name: Descargar la voz de NYX (es_ES sharvard, Piper)
+        continue-on-error: true  # sin la voz, la ISO se construye igual y NYX usa espeak-ng
+        run: |
+          V=iso/config/includes.chroot/usr/share/umbra/voices
+          BASE=https://huggingface.co/rhasspy/piper-voices/resolve/main/es/es_ES/sharvard/medium
+          mkdir -p "$V"
+          curl -fL --retry 3 -o "$V/es_ES-sharvard-medium.onnx" "$BASE/es_ES-sharvard-medium.onnx"
+          curl -fL --retry 3 -o "$V/es_ES-sharvard-medium.onnx.json" "$BASE/es_ES-sharvard-medium.onnx.json"
+          python3 -c "import json;print('Hablantes:', json.load(open('$V/es_ES-sharvard-medium.onnx.json')).get('speaker_id_map'))"
+
+      - name: Descargar el oído de NYX (modelo español pequeño de Vosk, ~40 MB)
+        continue-on-error: true  # sin el modelo, NYX funciona igual pero no escucha
+        run: |
+          M=iso/config/includes.chroot/usr/share/umbra/vosk
+          mkdir -p "$M"
+          curl -fL --retry 3 -o /tmp/vosk-es.zip https://alphacephei.com/vosk/models/vosk-model-small-es-0.42.zip
+          unzip -q /tmp/vosk-es.zip -d /tmp/vosk
+          mv /tmp/vosk/vosk-model-small-es-0.42 "$M/es"
+          du -sh "$M/es"
+
+      - name: Motor del cerebro de NYX (llama-server, versión oficial de llama.cpp)
+        continue-on-error: true  # sin motor, NYX funciona igual con su motor de intenciones
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          L=iso/config/includes.chroot/opt/umbra/llama
+          mkdir -p "$L" /tmp/llama
+          gh release download -R ggml-org/llama.cpp --pattern '*-bin-ubuntu-x64.zip' -D /tmp/llama
+          unzip -q /tmp/llama/*.zip -d /tmp/llama/x
+          # Solo el servidor y sus bibliotecas
+          find /tmp/llama/x -name 'llama-server' -exec cp {} "$L/" \;
+          find /tmp/llama/x -name '*.so*' -exec cp -P {} "$L/" \;
+          chmod 755 "$L/llama-server"
+          LD_LIBRARY_PATH="$L" "$L/llama-server" --version
+          du -sh "$L"
+
+      - name: Claves de los repositorios oficiales de Google Chrome y Opera GX
+        continue-on-error: true  # sin clave, ese repositorio se quita en la ISO (Chromium sigue incluido)
+        run: |
+          K=iso/config/includes.chroot/usr/share/keyrings
+          mkdir -p "$K"
+          curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor > "$K/google-chrome.gpg"
+          curl -fsSL https://deb.opera.com/archive.key | gpg --dearmor > "$K/opera.gpg"
+          ls -l "$K"
+
+      - name: Liberar espacio en disco del runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Construir la ISO en Debian 13
+        run: |
+          docker run --rm --privileged \
+            -v "$PWD/iso:/build" -w /build \
+            debian:trixie \
+            bash -c "apt-get update && \
+                     apt-get install -y --no-install-recommends live-build ca-certificates && \
+                     lb clean && lb config && lb build"
+
+      - name: Nombrar la ISO y calcular su suma de verificación
+        id: iso
+        run: |
+          VERSION=$(python3 -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          NAME="umbra-os-${VERSION}-amd64.iso"
+          sudo mv iso/live-image-amd64.hybrid.iso "$NAME"
+          sudo chown "$USER" "$NAME"
+          sha256sum "$NAME" > "$NAME.sha256"
+          ls -lh "$NAME"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Guardar la ISO como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: umbra-os-iso
+          path: |
+            ${{ steps.iso.outputs.name }}
+            ${{ steps.iso.outputs.name }}.sha256
+          retention-days: 14
+          compression-level: 0
+
+      - name: Guardar el registro de construcción
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: iso/build.log
+          if-no-files-found: ignore
+
+      - name: Publicar release (solo con etiqueta)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            "${{ steps.iso.outputs.name }}" "${{ steps.iso.outputs.name }}.sha256" \
+            --title "UMBRA OS ${GITHUB_REF_NAME}" \
+            --notes "ISO de UMBRA OS basada en Debian 13. Usuario en vivo: umbra / contraseña: live."
